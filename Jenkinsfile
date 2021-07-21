@@ -3,10 +3,11 @@ import org.stan.Utils
 
 def utils = new org.stan.Utils()
 def skipRemainingStages = false
+def skipOpenCL = false
 
 def setupCXX(failOnError = true, CXX = env.CXX, String stanc3_bin_url = "nightly") {
     errorStr = failOnError ? "-Werror " : ""
-    stanc3_bin_url_str = stanc3_bin_url != "nightly" ? "\nSTANC3_TEST_BIN_URL=${stanc3_bin_url}\n" : ""
+    stanc3_bin_url_str = stanc3_bin_url != "nightly" ? "\nSTANC3_TEST_BIN_URL=${stanc3_bin_url}\n" : "\n"
     writeFile(file: "make/local", text: "CXX=${CXX} ${errorStr}${stanc3_bin_url_str}")
 }
 
@@ -44,6 +45,13 @@ String stan_pr() {
         env.BRANCH_NAME
     }
 }
+String integration_tests_flags() {
+    if (params.compile_all_model) {
+        '--no-ignore-models '
+    } else {
+        ''
+    }
+}
 
 def isBranch(String b) { env.BRANCH_NAME == b }
 Boolean isPR() { env.CHANGE_URL != null }
@@ -61,6 +69,7 @@ pipeline {
         string(defaultValue: 'nightly', name: 'stanc3_bin_url',
           description: 'Custom stanc3 binary url')
         booleanParam(defaultValue: false, name: 'run_tests_all_os', description: 'Run unit and integration tests on all OS.')
+        booleanParam(defaultValue: false, name: 'compile_all_models', description: 'Run integration tests on the full test model suite.')
     }
     options {
         skipDefaultCheckout()
@@ -184,6 +193,9 @@ pipeline {
                     ].join(" ")
 
                     skipRemainingStages = utils.verifyChanges(paths)
+
+                    def openCLPaths = ['src/stan/model/indexing'].join(" ")
+                    skipOpenCL = utils.verifyChanges(openCLPaths)
                 }
             }
             post {
@@ -246,6 +258,31 @@ pipeline {
                     }
                     post { always { deleteDir() } }
                 }
+                stage('OpenCL GPU tests') {
+                    agent { label "gelman-group-win2 || linux-gpu" }
+                    steps {
+                        script {
+                            if (isUnix()) {
+                                deleteDir()
+                                unstash 'StanSetup'
+                                setupCXX(true, env.GCC, stanc3_bin_url())
+                                sh "echo STAN_OPENCL=true >> make/local"
+                                sh "echo OPENCL_PLATFORM_ID=${env.OPENCL_PLATFORM_ID_GPU} >> make/local"
+                                sh "echo OPENCL_DEVICE_ID=${env.OPENCL_DEVICE_ID_GPU} >> make/local"
+                                runTests("src/test/unit")
+                            } else {
+                                deleteDirWin()
+                                unstash 'StanSetup'
+                                setupCXX(false, env.CXX, stanc3_bin_url())
+                                bat "echo STAN_OPENCL=true >> make/local"
+                                bat "echo OPENCL_PLATFORM_ID=${env.OPENCL_PLATFORM_ID_GPU} >> make/local"
+                                bat "echo OPENCL_DEVICE_ID=${env.OPENCL_DEVICE_ID_GPU} >> make/local"
+                                bat 'echo LDFLAGS_OPENCL= -L"C:\\Program Files (x86)\\IntelSWTools\\system_studio_2020\\OpenCL\\sdk\\lib\\x64" -lOpenCL >> make/local'
+                                runTestsWin("src/test/unit")
+                            }
+                        }
+                    }
+                }
             }
         }
         stage('Integration') {
@@ -288,14 +325,14 @@ pipeline {
                                     """
                                 }
                             }
-                        }        
+                        }
                         sh """
                             cd performance-tests-cmdstan/cmdstan
                             echo 'O=0' >> make/local
                             echo 'CXX=${env.CXX}' >> make/local
                             make -j${env.PARALLEL} build
                             cd ..
-                            ./runPerformanceTests.py -j${env.PARALLEL} --runs=0 cmdstan/stan/src/test/test-models/good
+                            ./runPerformanceTests.py -j${env.PARALLEL} ${integration_tests_flags()}--runs=0 cmdstan/stan/src/test/test-models/good
                         """
                         sh """
                             cd performance-tests-cmdstan/cmdstan/stan
@@ -322,14 +359,14 @@ pipeline {
                         """
                         dir('performance-tests-cmdstan/cmdstan/stan'){
                             unstash 'StanSetup'
-                        }        
+                        }
                         sh """
                             cd performance-tests-cmdstan/cmdstan
                             echo 'O=0' >> make/local
                             echo 'CXX=${env.CXX}' >> make/local
                             make -j${env.PARALLEL} build
                             cd ..
-                            ./runPerformanceTests.py -j${env.PARALLEL} --runs=0 cmdstan/stan/src/test/test-models/good
+                            ./runPerformanceTests.py -j${env.PARALLEL} ${integration_tests_flags()}--runs=0 cmdstan/stan/src/test/test-models/good
                         """
                         sh """
                             cd performance-tests-cmdstan/cmdstan/stan
@@ -352,11 +389,28 @@ pipeline {
                     }
                     steps {
                         deleteDirWin()
+                        bat """
+                            git clone --recursive https://github.com/stan-dev/performance-tests-cmdstan
+                        """
+                        dir('performance-tests-cmdstan/cmdstan/stan'){
                             unstash 'StanSetup'
-                            setupCXX(false, env.CXX, stanc3_bin_url())
-                            bat "mingw32-make -f lib/stan_math/make/standalone math-libs"
-                            setupCXX(false)
-                            runTestsWin("src/test/integration", separateMakeStep=false)
+                        }
+                        writeFile(file: "performance-tests-cmdstan/cmdstan/make/local", text: "CXX=${CXX}\nPRECOMPILED_HEADERS=true")
+                        withEnv(["PATH+TBB=${WORKSPACE}\\performance-tests-cmdstan\\cmdstan\\stan\\lib\\stan_math\\lib\\tbb"]) {
+
+                            bat """
+                                cd performance-tests-cmdstan/cmdstan
+                                mingw32-make -j${env.PARALLEL} build
+                                cd ..
+                                python ./runPerformanceTests.py -j${env.PARALLEL} ${integration_tests_flags()}--runs=0 cmdstan/stan/src/test/test-models/good
+                            """
+                        }
+                        bat """
+                            cd performance-tests-cmdstan/cmdstan/stan
+                            python ./runTests.py src/test/integration/compile_standalone_functions_test.cpp
+                            python ./runTests.py src/test/integration/standalone_functions_test.cpp
+                            python ./runTests.py src/test/integration/multiple_translation_units_test.cpp
+                        """
                     }
                     post { always { deleteDirWin() } }
                 }
